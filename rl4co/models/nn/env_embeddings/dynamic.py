@@ -35,6 +35,15 @@ def env_dynamic_embedding(env_name: str, config: dict) -> nn.Module:
         "jssp": JSSPDynamicEmbedding,
         "fjsp": JSSPDynamicEmbedding,
         "mtvrp": StaticEmbedding,
+        "flp": StaticEmbedding,
+        "mcp": StaticEmbedding,
+        "mclp": StaticEmbedding,
+        "stp": StaticEmbedding,
+        # Graph problems (ML4CO wrappers)
+        "mis": StaticEmbedding,
+        "mvc": StaticEmbedding,
+        "mcl": StaticEmbedding,
+        "mcut": StaticEmbedding,
     }
 
     if env_name not in embedding_registry:

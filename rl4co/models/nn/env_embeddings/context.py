@@ -37,6 +37,13 @@ def env_context_embedding(env_name: str, config: dict) -> nn.Module:
         "shpp": TSPContext,
         "flp": FLPContext,
         "mcp": MCPContext,
+        "mclp": MCLPContext,
+        "stp": STPContext,
+        # Graph problems (ML4CO wrappers)
+        "mis": GraphContext,
+        "mvc": GraphContext,
+        "mcl": GraphContext,
+        "mcut": GraphContext,
     }
 
     if env_name not in embedding_registry:
@@ -446,3 +453,186 @@ class MCPContext(EnvContext):
         )  # (batch_size, n_sets)
         context_embedding = (membership_weighted.unsqueeze(-1) * embeddings).sum(1)
         return self.project_context(context_embedding)
+
+class MCLPContext(EnvContext):
+    def __init__(self, embed_dim: int):
+        super(MCLPContext, self).__init__(embed_dim=embed_dim)
+        self.embed_dim = embed_dim
+
+        # 输入维度解释:
+        # 1. weighted_embedding [embed_dim]: 通过 Softmax 加权后的设施特征
+        # 2. step_progress [1]: 进度条
+        # 3. covered_fraction [1]: 覆盖率
+        # 4. max_gain_ratio [1]: 当前盘面上最大的潜在收益 (强度特征)
+        self.project_context = nn.Linear(embed_dim + 3, embed_dim, bias=True)
+
+    def forward(self, embeddings, td):
+        # --- 1. 懒加载静态覆盖 Mask (Lazy Initialization) ---
+        if self.coverage_mask is None:
+            dist_matrix = td["distance_matrix"]
+            radius = td["coverage_radius"]
+            
+            # 维度对齐
+            if radius.dim() == 1:
+                radius = radius.view(-1, 1, 1)
+            elif radius.dim() == 2:
+                radius = radius.unsqueeze(-1)
+            
+            # 计算并 detach (不需要梯度)
+            mask = (dist_matrix <= radius).float().detach()
+            td["coverage_mask"] = mask
+
+        # --- 2. 计算潜在增益 (Potential Gain) ---
+        # 找出尚未被覆盖的需求
+        coverage_mask = td["coverage_mask"]
+        uncovered_mask = ~td["is_covered"]
+        valuable_demand = td["demand_weights"] * uncovered_mask.float()
+        
+        # 矩阵乘法计算每个 Facility 能覆盖的剩余权重和
+        # [B, N_demand, 1] * [B, N_demand, N_facility] -> sum -> [B, N_facility]
+        potential_gain = (valuable_demand.unsqueeze(-1) * coverage_mask).sum(dim=1)
+
+        # --- 3. 提取最大收益特征 (保留此特征以增强判断力) ---
+        max_gain, _ = potential_gain.max(dim=1)
+        total_demand = td["demand_weights"].sum(dim=-1)
+        max_gain_ratio = max_gain / (total_demand + 1e-8)
+
+        # --- 4. Softmax 加权聚合 (你要求的核心部分) ---
+        # 使用 Softmax 将 potential_gain 转化为概率分布
+        # 收益越高的节点，其 Embedding 在最终 Context 中的占比越大
+        potential_gain_norm = torch.softmax(potential_gain + 1e-8, dim=-1)
+        
+        # [B, N_fac, D] * [B, N_fac, 1] -> sum -> [B, D]
+        weighted_embedding = (embeddings * potential_gain_norm.unsqueeze(-1)).sum(dim=1)
+
+        # --- 5. 全局状态特征 ---
+        num_select = td["num_facilities_to_select"]
+        if num_select.dim() == 2: 
+            num_select = num_select.squeeze(-1)
+        
+        step_progress = td["i"].float() / num_select.float()
+        covered_fraction = td["covered_demand"].sum(dim=-1) / (total_demand + 1e-8)
+
+        # --- 6. 拼接并投影 ---
+        context_input = torch.cat([
+            weighted_embedding,
+            step_progress.unsqueeze(-1),
+            covered_fraction.unsqueeze(-1),
+            max_gain_ratio.unsqueeze(-1)
+        ], dim=-1)
+
+        return self.project_context(context_input)
+
+
+class STPContext(EnvContext):
+    """Context embedding for Edge-Based Steiner Tree Problem.
+    
+    Derives 'visited' status from 'selected_edges' to identify:
+    1. Nodes already in the tree (Source of growth).
+    2. Terminals NOT yet in the tree (Targets).
+    """
+
+    def __init__(self, embed_dim: int):
+        super(STPContext, self).__init__(embed_dim=embed_dim)
+        self.embed_dim = embed_dim
+        
+        # 输入维度: 
+        # weighted_embedding [D] + step_progress [1] + unvisited_terminal_ratio [1]
+        self.project_context = nn.Linear(embed_dim + 2, embed_dim, bias=True)
+
+    def forward(self, embeddings, td):
+        """
+        embeddings: [batch_size, num_nodes, embed_dim]
+        td keys utilized:
+            - terminals: [batch_size, num_terminals]
+            - selected_edges: [batch_size, num_nodes, num_nodes] (Adjacency of partial solution)
+            - i: Current step
+        """
+        batch_size, num_nodes, _ = embeddings.shape
+        device = embeddings.device
+
+        # --- 1. Lazy Init: Terminal Mask ---
+        # 这一步不变，先把哪些点是 Terminal 标记出来
+        if "is_terminal" not in td.keys():
+            is_terminal = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=device)
+            is_terminal.scatter_(1, td["terminals"].long(), True)
+            td["is_terminal"] = is_terminal # 缓存到 td
+            
+        is_terminal = td["is_terminal"]
+
+        # --- 2. 关键修改: 从 selected_edges 推导 Visited Mask ---
+        # 逻辑：如果一个节点连接了至少一条被选中的边，它就是"visited" (在树中)
+        # selected_edges 是 [B, N, N] 的布尔矩阵
+        selected_adj = td["selected_edges"]
+        
+        # 假设矩阵是无向的(对称的)，或者只需检查出度/入度之一即可
+        # 只要有一条边连着它，它就是树的一部分
+        # shape: [batch_size, num_nodes]
+        visited = selected_adj.any(dim=-1) 
+        
+        # 特殊处理 Step 0:
+        # 如果 i=0，没有任何边被选，visited 全为 False。
+        # 在这种情况下，我们可能希望模型关注所有 Terminal。
+        
+        # --- 3. 识别当前目标 (Unvisited Terminals) ---
+        # 既是 Terminal，又还没有连入树中的点
+        unvisited_terminals = is_terminal & (~visited)
+        
+        # --- 4. 构建动态权重 (Dynamic Weighting) ---
+        node_weights = torch.ones(batch_size, num_nodes, device=device)
+        
+        # 策略：
+        # - 没连上的 Terminal: 权重极高 (3.0) -> "快来连我"
+        # - 已经在树里的点 (Visited): 权重较低 (0.5) -> "我是树的根基，可以从我这里延伸"
+        # - 没连上的普通点: 权重中等 (1.0) -> "我可以做桥梁"
+        
+        node_weights[visited] = 0.5 
+        node_weights[~is_terminal] = 1.0
+        node_weights[unvisited_terminals] = 3.0 
+
+        # --- 5. Softmax 加权聚合 ---
+        node_weights_norm = torch.softmax(node_weights, dim=-1) # [B, N]
+        weighted_embeddings = (embeddings * node_weights_norm.unsqueeze(-1)).sum(dim=1)
+
+        # --- 6. 全局标量特征 ---
+        # 进度：当前选了多少条边 (相对于节点数)
+        # 假设完全连通大约需要 N-1 条边 (最小生成树)
+        step_progress = td["i"].float() / num_nodes 
+        
+        # 剩余任务比例：还有多少 terminal 没连上
+        num_terminals = td["terminals"].size(1)
+        num_unvisited_term = unvisited_terminals.sum(dim=1).float()
+        unvisited_ratio = num_unvisited_term / (num_terminals + 1e-8)
+
+        # --- 7. 拼接 ---
+        context_input = torch.cat([
+            weighted_embeddings,
+            step_progress.unsqueeze(-1),
+            unvisited_ratio.unsqueeze(-1)
+        ], dim=-1)
+        
+        return self.project_context(context_input)
+
+
+class GraphContext(EnvContext):
+    """Context embedding for graph problems (MIS, MVC, MCL, MCUT).
+    
+    Simple context that tracks the number of selected nodes and available nodes.
+    """
+    
+    def __init__(self, embed_dim: int):
+        # step_context_dim = embed_dim (current node) + 2 (state features)
+        super(GraphContext, self).__init__(embed_dim, step_context_dim=embed_dim + 2)
+        # We use 2D state features: [num_selected, num_available]
+        
+    def _state_embedding(self, embeddings: torch.Tensor, td: TensorDict) -> torch.Tensor:
+        # Selected nodes count
+        num_selected = td["selected"].float().sum(dim=-1)
+        
+        # Available nodes count
+        num_available = td["available"].float().sum(dim=-1)
+        
+        # Concatenate: [batch, 2]
+        context_features = torch.stack([num_selected, num_available], dim=-1)
+        
+        return context_features

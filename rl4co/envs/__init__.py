@@ -5,7 +5,7 @@ from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.envs.eda import DPPEnv, MDPPEnv
 
 # Graph
-from rl4co.envs.graph import FLPEnv, MCPEnv
+from rl4co.envs.graph import FLPEnv, MCPEnv, MCLPEnv, STPEnv
 
 # Routing
 from rl4co.envs.routing import (
@@ -59,6 +59,8 @@ ENV_REGISTRY = {
     "tsp_kopt": TSPkoptEnv,
     "mcp": MCPEnv,
     "flp": FLPEnv,
+    "mclp": MCLPEnv,
+    "stp": STPEnv,
 }
 
 

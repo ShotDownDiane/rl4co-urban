@@ -42,6 +42,13 @@ def env_init_embedding(env_name: str, config: dict) -> nn.Module:
         "shpp": TSPInitEmbedding,
         "flp": FLPInitEmbedding,
         "mcp": MCPInitEmbedding,
+        "mclp": MCLPInitEmbedding,
+        "stp": STPInitEmbedding,
+        # Graph problems (ML4CO wrappers)
+        "mis": GraphInitEmbedding,
+        "mvc": GraphInitEmbedding,
+        "mcl": GraphInitEmbedding,
+        "mcut": GraphInitEmbedding,
     }
 
     if env_name not in embedding_registry:
@@ -586,3 +593,192 @@ class MCPInitEmbedding(nn.Module):
         # sum pooling
         membership_emb = batched_scatter_sum(items_embed, td["membership"].long())
         return membership_emb
+
+class MCLPInitEmbedding(nn.Module):
+    """Initial embedding for MCLP based on Demand Aggregation.
+    
+    Philosophy (MCP-like):
+    A facility is defined by the demand nodes it covers.
+    Embedding = (Projected Facility Coords) + (Sum of Covered Demand Embeddings)
+    """
+
+    def __init__(self, embed_dim: int, linear_bias=True):
+        super(MCLPInitEmbedding, self).__init__()
+        self.embed_dim = embed_dim
+        
+        # 1. 需求点特征映射 (Demand Projection)
+        # 将需求点的权重 (scalar) 映射为向量
+        self.project_demand = nn.Linear(1, embed_dim, bias=linear_bias)
+        
+        # 2. 设施自身位置映射 (Facility Projection)
+        # 保留这个是为了区分空间位置不同但覆盖相同的极端情况
+        self.project_facility = nn.Linear(2, embed_dim, bias=linear_bias)
+
+    def forward(self, td: TensorDict):
+        # --- A. 准备数据 ---
+        # 需求权重: [batch_size, num_demand]
+        demand_weights = td["demand_weights"]
+        
+        # 设施坐标: [batch_size, num_facility, 2]
+        facility_locs = td["facility_locs"]
+        
+        # 覆盖掩码 (Lazy Init 逻辑，同 Context)
+        # 如果前面 Context 算过了，这里直接拿；没算过这里算。
+        # [batch_size, num_demand, num_facility]
+        if "coverage_mask" not in td.keys():
+            dist = td["distance_matrix"]
+            rad = td["coverage_radius"]
+            if rad.dim() == 1: rad = rad.view(-1, 1, 1)
+            elif rad.dim() == 2: rad = rad.unsqueeze(-1)
+            td["coverage_mask"] = (dist <= rad).float().detach()
+        
+        coverage_mask = td["coverage_mask"]
+
+        # --- B. 需求侧 Embedding (Item Embedding) ---
+        # [B, N_d] -> [B, N_d, 1] -> [B, N_d, embed_dim]
+        demand_emb = self.project_demand(demand_weights.unsqueeze(-1))
+
+        # --- C. 聚合逻辑 (Aggregation / Pooling) ---
+        # 类似于 MCP 的 batched_scatter_sum，但这里是多对多关系，用矩阵乘法更高效
+        # 公式: Facility_Emb = Sum_{d \in Covered} (Demand_Emb_d)
+        
+        # Transpose mask: [B, N_facility, N_demand]
+        mask_t = coverage_mask.transpose(1, 2)
+        
+        # MatMul: [B, N_f, N_d] @ [B, N_d, Dim] -> [B, N_f, Dim]
+        # 这一步就把"该设施覆盖的所有需求点的特征"加总到了设施上
+        aggregated_demand_emb = torch.matmul(mask_t, demand_emb)
+
+        # --- D. 设施侧 Embedding (Location Embedding) ---
+        # [B, N_f, 2] -> [B, N_f, Dim]
+        facility_loc_emb = self.project_facility(facility_locs)
+
+        # --- E. 融合 (Fusion) ---
+        # 简单的相加 (ResNet style)，融合"我在哪"和"我覆盖谁"的信息
+        final_embedding = facility_loc_emb + aggregated_demand_emb
+        
+        return final_embedding
+
+
+class STPInitEmbedding(nn.Module):
+    """Memory-Efficient Graph-Aware Embedding for STP.
+    
+    Architecture:
+    1. Node Stream: Loc + Terminal ID -> [B, N, D]
+    2. Edge Stream: Edge Cost -> Learned Scalar Weight -> [B, N, N]
+    3. Aggregation: Weighted GCN (Matrix Multiplication)
+    
+    Memory Complexity: O(N^2) instead of O(N^2 * D)
+    """
+
+    def __init__(self, embed_dim: int, linear_bias=True):
+        super(STPInitEmbedding, self).__init__()
+        self.embed_dim = embed_dim
+        
+        # --- 1. 节点特征处理 ---
+        self.project_loc = nn.Linear(2, embed_dim, bias=linear_bias)
+        self.embed_type = nn.Embedding(2, embed_dim) # 0: Steiner, 1: Terminal
+        
+        # --- 2. 边权重变换 (关键优化) ---
+        # 这是一个微型 MLP，用于将"成本(Cost)"转化为"亲和度(Affinity)"
+        # 输入 1 维 (权重)，输出 1 维 (聚合系数)
+        self.edge_gate = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1), 
+            nn.Sigmoid() # 输出归一化到 (0, 1)，类似于门控
+        )
+        
+        # --- 3. 融合层 ---
+        # 输入是: 自身特征 [D] + 邻居聚合特征 [D]
+        self.proj_fusion = nn.Linear(2 * embed_dim, embed_dim, bias=linear_bias)
+
+    def forward(self, td: TensorDict):
+        # td["locs"]: [B, N, 2]
+        batch_size, num_nodes, _ = td["locs"].shape
+        device = td["locs"].device
+        
+        # ==========================================
+        # Part A: 构建基础节点特征 (Node Features)
+        # ==========================================
+        
+        # 1. 生成 Terminal Mask (Lazy Init + Scatter)
+        if "is_terminal" not in td.keys():
+            is_terminal = torch.zeros(batch_size, num_nodes, dtype=torch.long, device=device)
+            is_terminal.scatter_(1, td["terminals"].long(), 1) # Index -> 1
+            td["is_terminal"] = is_terminal
+        
+        # 2. 融合几何与语义 (Add)
+        # [B, N, D]
+        h_geo = self.project_loc(td["locs"])
+        h_type = self.embed_type(td["is_terminal"])
+        h_nodes = h_geo + h_type 
+        
+        # ==========================================
+        # Part B: 学习型图聚合 (Learned Graph Aggregation)
+        # ==========================================
+        
+        # 1. 准备边数据
+        # edge_weights: [B, N, N] (Costs/Distances)
+        # adjacency: [B, N, N] (0/1 Mask, indicating edge existence)
+        edge_costs = td["edge_weights"]
+        adj_mask = td["adjacency"]
+        
+        # 2. 计算动态聚合系数 (Learnable Coefficients)
+        # 为什么要学？因为 STP 中 EdgeWeight 是 Cost。
+        # 直接用 Cost 做聚合权重是错的（越远权重应该越小）。
+        # 让网络学习一个函数 f(cost) -> affinity
+        
+        # [B, N, N, 1]
+        cost_input = edge_costs.unsqueeze(-1) 
+        
+        # [B, N, N, 1] -> [B, N, N]
+        # 使用 detach() 仅仅是为了安全，如果 edge_weights 需要梯度则去掉
+        # 但通常 STP 的 edge_weights 是固定输入
+        affinity_scores = self.edge_gate(cost_input).squeeze(-1)
+        
+        # 3. 应用邻接掩码
+        # 只保留真实存在的边。
+        # 这一步产生稀疏权重的 Dense 表示
+        weighted_adj = affinity_scores * adj_mask.float()
+        
+        # 4. 图卷积聚合 (Matrix Multiplication)
+        # [B, N, N] @ [B, N, D] -> [B, N, D]
+        # 含义：每个节点收集所有邻居的特征，且根据边的"好坏"加权
+        h_struct = torch.matmul(weighted_adj, h_nodes)
+        
+        # ==========================================
+        # Part C: 最终融合 (Fusion)
+        # ==========================================
+        
+        # 拼接 自身信息 [D] 和 结构环境信息 [D]
+        # [B, N, 2D]
+        h_combined = torch.cat([h_nodes, h_struct], dim=-1)
+        
+        # 投影回 [B, N, D]
+        h_final = self.proj_fusion(h_combined)
+        
+        return h_final
+
+
+class GraphInitEmbedding(nn.Module):
+    """Initial embedding for graph problems (MIS, MVC, MCL, MCUT).
+    
+    Embeds node weights to the embedding space. For unweighted graphs,
+    uses uniform weights.
+    """
+    
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        # Project node weight (1D) to embedding space
+        self.projection = nn.Linear(1, embed_dim, bias=True)
+    
+    def forward(self, td: TensorDict):
+        # td["nodes_weight"]: [batch, num_nodes]
+        # Unsqueeze to [batch, num_nodes, 1] for projection
+        node_weights = td["nodes_weight"].unsqueeze(-1)
+        
+        # Project to embedding space: [batch, num_nodes, embed_dim]
+        h = self.projection(node_weights)
+        
+        return h

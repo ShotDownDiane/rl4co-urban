@@ -33,6 +33,9 @@ class NonAutoregressiveDecoder(ConstructiveDecoder):
         batch_size = heatmaps_logits.shape[0]
         _indexer = _multistart_batched_index(batch_size, num_starts)
         assert _indexer.shape[0] == td.shape[0]
+        
+        # Clone indexer to avoid inference tensor issue with lru_cache
+        _indexer = _indexer.clone()
 
         current_node = td.get("current_node", None).squeeze(-1)
         if current_node is None:

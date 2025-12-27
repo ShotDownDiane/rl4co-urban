@@ -20,6 +20,7 @@ from rl4co.models.zoo.l2d import (
     L2DPPOModel,
 )
 from rl4co.models.zoo.matnet import MatNet, MatNetPolicy
+from rl4co.models.zoo.MCTS import MCTS, MCTSModel, MCTSNode
 from rl4co.models.zoo.mdam import MDAM, MDAMPolicy
 from rl4co.models.zoo.mvmoe import MVMoE_AM, MVMoE_POMO
 from rl4co.models.zoo.n2s import N2S, N2SPolicy

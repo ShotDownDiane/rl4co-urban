@@ -219,7 +219,7 @@ class RolloutBaseline(REINFORCEBaseline):
             p_val = p / 2  # one-sided
             assert t < 0, "T-statistic should be negative"
             log.info("p-value: {:.3f}".format(p_val))
-            if p_val < self.bl_alpha:
+            if p_val.item() < self.bl_alpha:
                 log.info("Updating baseline")
                 self._update_policy(policy, env, batch_size, device, dataset_size)
 
