@@ -75,18 +75,7 @@ class MCLPGenerator(Generator):
         batch_size_val = batch_size[0] if isinstance(batch_size, (list, tuple)) else batch_size
 
         # 1. Generate Demand Locations based on Distribution
-        if self.distribution == "uniform":
-            demand_locs = self.loc_sampler.sample((*batch_size, self.num_demand, 2))
-        elif self.distribution == "cluster":
-            demand_locs = self._generate_clusters(batch_size_val, self.num_demand)
-        elif self.distribution == "explosion":
-            demand_locs = self._generate_explosion(batch_size_val, self.num_demand)
-        else:
-            raise ValueError(f"Unknown distribution: {self.distribution}")
-
-        # Scale locations if generated via custom methods (which output 0-1)
-        if self.distribution in ["cluster", "explosion"]:
-            demand_locs = demand_locs * (self.max_loc - self.min_loc) + self.min_loc
+        demand_locs = self.loc_sampler.sample((*batch_size, self.num_demand, 2))
 
         # 2. Generate Demand Weights (Need these early for Greedy Seeding)
         demand_weights = self._generate_weights(demand_locs, batch_size_val)

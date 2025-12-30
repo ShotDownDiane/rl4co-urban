@@ -52,6 +52,22 @@ def solve_mclp_gurobi(
         axis=2
     )
     coverage_matrix = (dist_matrix <= coverage_radius).astype(int)
+
+    # Check for trivial case: if we can select more facilities than available, select all
+    if num_facilities_to_select >= n_facility:
+        selected = np.arange(n_facility)
+        # Calculate coverage
+        covered = coverage_matrix.any(axis=1)
+        obj_value = demand_weights[covered].sum()
+        
+        info = {
+            'solve_time': time.time() - start_time,
+            'status': 'optimal',
+            'gap': 0.0,
+            'covered_demands': covered.sum(),
+            'coverage_rate': covered.mean(),
+        }
+        return selected, obj_value, info
     
     # 创建模型
     model = gp.Model("MCLP")
@@ -71,9 +87,9 @@ def solve_mclp_gurobi(
         GRB.MAXIMIZE
     )
     
-    # 约束1: 恰好选择 num_facilities_to_select 个设施
+    # 约束1: 最多选择 num_facilities_to_select 个设施 (Use <= for robustness)
     model.addConstr(
-        gp.quicksum(x[j] for j in range(n_facility)) == num_facilities_to_select,
+        gp.quicksum(x[j] for j in range(n_facility)) <= num_facilities_to_select,
         "num_facilities"
     )
     
@@ -156,6 +172,22 @@ def solve_mclp_scip(
         axis=2
     )
     coverage_matrix = (dist_matrix <= coverage_radius).astype(int)
+
+    # Check for trivial case: if we can select more facilities than available, select all
+    if num_facilities_to_select >= n_facility:
+        selected = np.arange(n_facility)
+        # Calculate coverage
+        covered = coverage_matrix.any(axis=1)
+        obj_value = demand_weights[covered].sum()
+        
+        info = {
+            'solve_time': time.time() - start_time,
+            'status': 'optimal',
+            'gap': 0.0,
+            'covered_demands': covered.sum(),
+            'coverage_rate': covered.mean(),
+        }
+        return selected, obj_value, info
     
     # 创建模型
     model = Model("MCLP")
@@ -179,7 +211,7 @@ def solve_mclp_scip(
     
     # 约束
     model.addCons(
-        quicksum(x[j] for j in range(n_facility)) == num_facilities_to_select,
+        quicksum(x[j] for j in range(n_facility)) <= num_facilities_to_select,
         "num_facilities"
     )
     
